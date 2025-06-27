@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+import msgpack
 from prometheus_client import make_asgi_app
 from prometheus_fastapi_instrumentator import Instrumentator
 from starlette.concurrency import iterate_in_threadpool
@@ -322,6 +323,15 @@ async def validate_json_request(raw_request: Request):
         ])
 
 
+async def validate_msgpack_request(raw_request: Request):
+    content_type = raw_request.headers.get("content-type", "").lower()
+    media_type = content_type.split(";", maxsplit=1)[0]
+    if media_type != "application/msgpack":
+        raise RequestValidationError(errors=[
+            "Unsupported Media Type: Only 'application/msgpack' is allowed"
+        ])
+
+
 router = APIRouter()
 
 
@@ -556,6 +566,54 @@ async def create_chat_completion(request: ChatCompletionRequest,
     if handler is None:
         return base(raw_request).create_error_response(
             message="The model does not support Chat Completions API")
+
+    generator = await handler.create_chat_completion(request, raw_request)
+
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content=generator.model_dump(),
+                            status_code=generator.code)
+
+    elif isinstance(generator, ChatCompletionResponse):
+        return JSONResponse(content=generator.model_dump())
+
+    return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/v1/plumerai/chat/completions",
+             dependencies=[Depends(validate_msgpack_request)],
+             responses={
+                 HTTPStatus.OK.value: {
+                     "content": {
+                         "text/event-stream": {}
+                     }
+                 },
+                 HTTPStatus.BAD_REQUEST.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.NOT_FOUND.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.INTERNAL_SERVER_ERROR.value: {
+                     "model": ErrorResponse
+                 }
+             })
+@with_cancellation
+@load_aware_call
+async def create_plumerai_chat_completion(raw_request: Request):
+    handler = chat(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(
+            message="The model does not support Chat Completions API")
+
+    try:
+        body_bytes = await raw_request.body()
+        request_dict = msgpack.unpackb(body_bytes)
+        request = ChatCompletionRequest.model_validate(request_dict)
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Failed to deserialize msgpack request: {str(e)}") from e
 
     generator = await handler.create_chat_completion(request, raw_request)
 
